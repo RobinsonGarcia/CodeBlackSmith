@@ -1,0 +1,770 @@
+### __init__.py ###
+# codepromptforge/__init__.py
+"""
+codepromptforge package initialization module.
+
+This package provides functionality to combine code files into a single prompt,
+making it easy to use with large language models (LLMs) for tasks such as
+bug fixing, code improvements, and modifications.
+"""
+### cli.py ###
+import argparse
+import json
+import sys
+from codepromptforge.main import (
+    CodePromptForge, 
+    InvalidBaseDirectoryError, 
+    NoFilesFoundError, 
+    OutputFileAlreadyExistsError
+)
+
+def main():
+    parser = argparse.ArgumentParser(description="Code management CLI.")
+    parser.add_argument(
+        "command",
+        choices=["tree", "file", "files", "files_recursive", "write", "combine", "clean_result"],
+        help="Command to execute"
+    )
+    parser.add_argument("--folder", help="Folder path")
+    parser.add_argument("--file", help="File path")
+    parser.add_argument("--content", help="Content for writing")
+    parser.add_argument("--base-dir", default=".", help="Base directory")
+    parser.add_argument("--extensions", nargs="*", default=[], help="File extensions for combining")
+    parser.add_argument("--output-file", help="Output file for combination")
+    parser.add_argument("--force", action="store_true", help="Force overwrite existing output file")
+    parser.add_argument("--exclude", nargs="*", default=[], help="List of files to exclude from concatenation")
+    parser.add_argument("--exclude-clean", nargs="*", default=[], help="Files to remove from .result folder")
+
+    args = parser.parse_args()
+
+    forge = CodePromptForge(
+        base_dir=args.base_dir,
+        output_file=args.output_file,
+        force=args.force,
+        excluded=args.exclude
+    )
+
+    try:
+        if args.command == "tree":
+            if not args.folder:
+                print("Error: The --folder argument is required for 'tree' command.", file=sys.stderr)
+                sys.exit(1)
+            print(forge.get_directory_tree(args.folder))
+
+        elif args.command == "file":
+            if not args.file:
+                print("Error: The --file argument is required for 'file' command.", file=sys.stderr)
+                sys.exit(1)
+            print(forge.get_file_content(args.file))
+
+        elif args.command == "files":
+            if not args.folder:
+                raise ValueError("The --folder argument is required for 'files' command.")
+            print(json.dumps(forge.get_files_in_folder(args.folder), indent=2))
+
+        elif args.command == "files_recursive":
+            if not args.folder:
+                raise ValueError("The --folder argument is required for 'files_recursive' command.")
+            print(json.dumps(forge.get_files_recursively(args.folder), indent=2))
+
+        elif args.command == "write":
+            if not args.file or not args.content:
+                raise ValueError("Both --file and --content arguments are required for 'write' command.")
+            print(forge.write_file(args.file, args.content))
+
+        elif args.command == "combine":
+            if not args.extensions or not args.output_file:
+                raise ValueError("--extensions and --output-file are required for 'combine'.")
+            forge.forge_prompt(args.extensions)
+
+        elif args.command == "clean_result":
+            if not args.exclude_clean:
+                raise ValueError("--exclude-clean argument is required for 'clean_result'.")
+            forge.clean_result_folder(args.exclude_clean)
+
+    except (InvalidBaseDirectoryError, NoFilesFoundError, OutputFileAlreadyExistsError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+### main.py ###
+import os
+from pathlib import Path
+from typing import List, Dict, Optional, Type
+from pydantic import BaseModel, Field
+from langchain_core.tools import BaseTool
+import pathspec  # ✅ Added for .gitignore handling
+
+class InvalidBaseDirectoryError(Exception):
+    pass
+
+class NoFilesFoundError(Exception):
+    pass
+
+class OutputFileAlreadyExistsError(Exception):
+    pass
+
+class CodePromptForge:
+    def __init__(
+        self,
+        base_dir: str,
+        output_file: str = None,
+        dry_run: bool = False,
+        force: bool = False,
+        include_tree: bool = False,
+        excluded: Optional[List[str]] = None
+    ):
+        self.base_dir = Path(base_dir).resolve()
+        if not self.base_dir.exists() or not self.base_dir.is_dir():
+            raise InvalidBaseDirectoryError(f"Base directory '{self.base_dir}' does not exist or is not a directory.")
+
+        self.output_file = Path(output_file) if output_file else None
+        self.dry_run = dry_run
+        self.force = force
+        self.include_tree = include_tree
+        self.result_dir = self.base_dir / ".result"
+        self.result_dir.mkdir(parents=True, exist_ok=True)
+
+        # Load .gitignore patterns
+        self.gitignore_spec = self._load_gitignore()
+
+        # Convert excluded files into a set for quick lookup
+        self.excluded = set(excluded or [])
+
+    def _load_gitignore(self) -> Optional[pathspec.PathSpec]:
+        """Loads `.gitignore` and compiles it into a pathspec matcher."""
+        gitignore_path = self.base_dir / ".gitignore"
+        if not gitignore_path.exists():
+            return None  # No .gitignore found
+
+        with gitignore_path.open("r", encoding="utf-8") as f:
+            gitignore_patterns = f.readlines()
+
+        return pathspec.PathSpec.from_lines("gitwildmatch", gitignore_patterns)
+
+    def _is_ignored(self, file_path: Path) -> bool:
+        """Checks if a file is ignored by .gitignore, explicitly excluded, or in `.git`."""
+        relative_path = str(file_path.relative_to(self.base_dir))
+        return (
+            (self.gitignore_spec and self.gitignore_spec.match_file(relative_path))  # ✅ Checks against .gitignore
+            or (relative_path in self.excluded)  # ✅ Explicit exclusions
+            or (".git/" in relative_path or relative_path.startswith(".git"))  # ✅ Always ignore `.git`
+        )
+
+    def get_directory_tree(self, folder_path: str) -> List[str]:
+        """Returns a list of all files in the specified folder, excluding ignored ones."""
+        target_path = self.base_dir / folder_path
+        if not target_path.is_dir():
+            raise InvalidBaseDirectoryError(f"Invalid directory: {target_path}")
+
+        return [
+            str(file.relative_to(self.base_dir))
+            for file in target_path.rglob("*")
+            if file.is_file() and not self._is_ignored(file)
+        ]
+
+    def get_file_content(self, file_path: str) -> str:
+        target_file = self.base_dir / file_path
+        if not target_file.is_file() or self._is_ignored(target_file):
+            raise FileNotFoundError(f"File not found or ignored: {target_file}")
+        return target_file.read_text(encoding="utf-8")
+
+    def get_files_in_folder(self, folder_path: str) -> Dict[str, str]:
+        target_folder = self.base_dir / folder_path
+        if not target_folder.is_dir():
+            raise InvalidBaseDirectoryError(f"Invalid directory: {target_folder}")
+
+        return {
+            file.name: file.read_text(encoding="utf-8")
+            for file in target_folder.iterdir()
+            if file.is_file() and not self._is_ignored(file)
+        }
+
+    def get_files_recursively(self, folder_path: str) -> Dict[str, str]:
+        target_folder = self.base_dir / folder_path
+        if not target_folder.is_dir():
+            raise InvalidBaseDirectoryError(f"Invalid directory: {target_folder}")
+
+        return {
+            str(file.relative_to(self.base_dir)): file.read_text(encoding="utf-8")
+            for file in target_folder.rglob("*")
+            if file.is_file() and not self._is_ignored(file)
+        }
+
+    def write_file(self, file_path: str, content: str) -> str:
+        """Writes a file inside .result folder and ensures it exists."""
+        self.result_dir.mkdir(parents=True, exist_ok=True)
+        result_file = self.result_dir / file_path
+        result_file.write_text(content, encoding="utf-8")
+        return f"File written successfully: {result_file}"
+
+    def find_files(self, extensions: List[str]) -> List[Path]:
+        matched_files = [
+            file_path
+            for ext in extensions
+            for file_path in self.base_dir.rglob(f"*.{ext}")
+            if not self._is_ignored(file_path)
+        ]
+        if not matched_files:
+            raise NoFilesFoundError(f"No files found for extensions {extensions} in '{self.base_dir}'.")
+        return sorted(set(matched_files))
+
+    def _validate_output_file(self) -> None:
+        """Ensures output file does not already exist unless force=True."""
+        if self.output_file and self.output_file.exists() and not self.force:
+            raise OutputFileAlreadyExistsError(
+                f"Output file '{self.output_file}' already exists. Use --force to overwrite."
+            )
+
+    def forge_prompt(self, extensions: List[str]) -> None:
+        self._validate_output_file()
+        files = self.find_files(extensions)
+        if self.dry_run:
+            print("\n".join(str(f) for f in files))
+            return
+        if not files:
+            print("No files found for combination.")
+            return
+        self.output_file.parent.mkdir(parents=True, exist_ok=True)
+        with self.output_file.open('w', encoding='utf-8') as outfile:
+            if self.include_tree:
+                outfile.write("Directory Tree:\n")
+                outfile.write("\n".join(self.get_directory_tree(".")) + "\n")
+            for file in files:
+                outfile.write(f"### {file.name} ###\n")
+                outfile.write(file.read_text(encoding="utf-8"))
+                outfile.write("\n")
+
+    def run(self, extensions: List[str]) -> None:
+        self.forge_prompt(extensions)
+
+    def clean_result_folder(self, excluded_files: List[str]) -> None:
+        self.result_dir.mkdir(parents=True, exist_ok=True)
+        deleted_files = []
+        for file_name in excluded_files:
+            file_path = self.result_dir / file_name
+            if file_path.exists() and file_path.is_file():
+                file_path.unlink()
+                deleted_files.append(file_name)
+        print(f"Cleaned .result folder. Removed files: {deleted_files}")
+
+    def get_tools(self) -> List[BaseTool]:
+        """Returns LangChain-compatible tools with access to CodePromptForge methods."""
+
+        class GetDirectoryTreeInput(BaseModel):
+            folder_path: str = Field(..., description="The directory path to generate a tree from.")
+
+        class GetFileContentInput(BaseModel):
+            file_path: str = Field(..., description="Path of the file to read.")
+
+        class WriteFileInput(BaseModel):
+            file_path: str = Field(..., description="Path to save the file.")
+            content: str = Field(..., description="Content to be written in the file.")
+
+        class CleanResultFolderInput(BaseModel):
+            excluded_files: List[str] = Field(..., description="List of filenames to remove inside .result folder.")
+
+        class GetFilesInFolderInput(BaseModel):
+            folder_path: str = Field(..., description="Path of the folder to list files from.")
+
+        class GetFilesRecursivelyInput(BaseModel):
+            folder_path: str = Field(..., description="Path of the folder to recursively list files.")
+
+        class FindFilesInput(BaseModel):
+            extensions: List[str] = Field(..., description="List of file extensions to search for.")
+
+        class ForgePromptInput(BaseModel):
+            extensions: List[str] = Field(..., description="List of file extensions to include in the prompt.")
+
+        forge = self
+
+        class GetDirectoryTreeTool(BaseTool):
+            name: str = "get_directory_tree"
+            description: str = "Returns a list of all files in the specified folder, with paths relative to the base directory."
+            args_schema: Type[BaseModel] = GetDirectoryTreeInput
+
+            def _run(self, folder_path: str) -> List[str]:
+                return forge.get_directory_tree(folder_path)
+
+        class GetFileContentTool(BaseTool):
+            name: str = "get_file_content"
+            description: str = "Retrieves the content of a specified file."
+            args_schema: Type[BaseModel] = GetFileContentInput
+
+            def _run(self, file_path: str) -> str:
+                return forge.get_file_content(file_path)
+
+        class GetFilesInFolderTool(BaseTool):
+            name: str = "get_files_in_folder"
+            description: str = "Lists all files in the specified folder."
+            args_schema: Type[BaseModel] = GetFilesInFolderInput
+
+            def _run(self, folder_path: str) -> Dict[str, str]:
+                return forge.get_files_in_folder(folder_path)
+
+        class GetFilesRecursivelyTool(BaseTool):
+            name: str = "get_files_recursively"
+            description: str = "Lists all files in a folder and its subfolders."
+            args_schema: Type[BaseModel] = GetFilesRecursivelyInput
+
+            def _run(self, folder_path: str) -> Dict[str, str]:
+                return forge.get_files_recursively(folder_path)
+
+        class FindFilesTool(BaseTool):
+            name: str = "find_files"
+            description: str = "Finds files with the specified extensions in the base directory."
+            args_schema: Type[BaseModel] = FindFilesInput
+
+            def _run(self, extensions: List[str]) -> List[str]:
+                return [str(file) for file in forge.find_files(extensions)]
+
+        class WriteFileTool(BaseTool):
+            name: str = "write_file"
+            description: str = "Writes content to a file inside the .result folder."
+            args_schema: Type[BaseModel] = WriteFileInput
+
+            def _run(self, file_path: str, content: str) -> str:
+                return forge.write_file(file_path, content)
+
+        class CleanResultFolderTool(BaseTool):
+            name: str = "clean_result_folder"
+            description: str = "Deletes specific files inside the .result folder."
+            args_schema: Type[BaseModel] = CleanResultFolderInput
+
+            def _run(self, excluded_files: List[str]) -> None:
+                return forge.clean_result_folder(excluded_files)
+
+        class ForgePromptTool(BaseTool):
+            name: str = "forge_prompt"
+            description: str = "Combines and processes code files into a single prompt."
+            args_schema: Type[BaseModel] = ForgePromptInput
+
+            def _run(self, extensions: List[str]) -> None:
+                return forge.forge_prompt(extensions)
+
+        class RunTool(BaseTool):
+            name: str = "run"
+            description: str = "Runs the forge process on the specified file extensions."
+            args_schema: Type[BaseModel] = ForgePromptInput
+
+            def _run(self, extensions: List[str]) -> None:
+                return forge.run(extensions)
+
+        return [
+            GetDirectoryTreeTool(),
+            GetFileContentTool(),
+            GetFilesInFolderTool(),
+            GetFilesRecursivelyTool(),
+            FindFilesTool(),
+            WriteFileTool(),
+            CleanResultFolderTool(),
+            ForgePromptTool(),
+            RunTool(),
+        ]
+### prompt.py ###
+react_template = """
+You are an AI code reviewer and generator, responsible for analyzing and improving software projects. Your goal is to assist in reviewing, modifying, and generating high-quality code while leveraging the available tools.
+
+Guidelines
+	1.	Understand the Context
+	•	Start by retrieving the directory tree using get_directory_tree to get an overview of the project.
+	•	Identify relevant files for analysis using find_files (e.g., Python, JavaScript, or other specified extensions).
+	2.	Analyze the Codebase
+	•	Read individual files with get_file_content to understand their structure and functionality.
+	•	If a specific folder needs inspection, use get_files_in_folder or get_files_recursively.
+	3.	Apply Code Review Principles
+	•	Look for bugs, security risks, and inefficiencies in the code.
+	•	Identify inconsistent styles, redundant code, or performance issues.
+	•	Ensure compliance with best practices and design patterns.
+	4.	Enhance and Optimize Code
+	•	If issues are found, suggest improvements, refactors, or optimizations.
+	•	If a function, class, or module is missing, generate the necessary code.
+	•	Ensure that any new code aligns with existing conventions and patterns.
+	5.	Write and Save Modifications
+	•	If a change is required, write modified code to a file using write_file.
+	•	If multiple changes are needed, manage them efficiently without overwriting critical files.
+	6.	Ensure Clean Project State
+	•	Before finalizing, check the .result folder for unnecessary files and remove them using clean_result_folder.
+	•	Ensure that ignored files (from .gitignore) are not included in the process.
+
+Tools Available
+
+You have access to the following tools:
+	•	get_directory_tree(folder_path): Retrieve a list of all files in a given folder.
+	•	get_file_content(file_path): Read the contents of a specific file.
+	•	get_files_in_folder(folder_path): List all files in a folder.
+	•	get_files_recursively(folder_path): Retrieve files from a folder and its subdirectories.
+	•	find_files(extensions): Find all files matching a given set of extensions.
+	•	write_file(file_path, content): Write or overwrite a file.
+	•	clean_result_folder(excluded_files): Remove unnecessary files from the .result folder.
+	•	forge_prompt(extensions): Generate a combined prompt from selected files.
+
+Expected Workflow
+	1.	Retrieve the project structure using get_directory_tree.
+	2.	Identify key files using find_files(["py"]) (or other specified extensions).
+	3.	Analyze relevant files using get_file_content.
+	4.	Identify areas for improvement (bugs, optimizations, security).
+	5.	Suggest and generate improved code where necessary.
+	6.	Write updated files using write_file without overriding critical files.
+	7.	Ensure clean project state using clean_result_folder where appropriate.
+
+Your task is to review, analyze, and generate code while following best practices. If modifications are needed, ensure they are well-structured and aligned with the existing codebase.
+"""
+
+### setup.py ###
+from setuptools import setup, find_packages
+
+setup(
+    name="codepromptforge",             
+    version="0.1.1",                
+    packages=find_packages(),
+    install_requires=[],            
+    entry_points={
+        "console_scripts": [
+            "codepromptforge=codepromptforge.cli:main"
+        ],
+    },
+    description="A tool to combine code files into a single prompt",
+    long_description=open("README.md").read(),
+    long_description_content_type="text/markdown",
+    author="RG",
+    url="https://github.com/RobinsonGarcia/CodePromptForge",
+    author_email="rlsgarcia@icloud.com",
+    classifiers=[
+        "Programming Language :: Python :: 3",
+        "License :: OSI Approved :: MIT License",
+        "Operating System :: OS Independent",
+    ],
+    python_requires=">=3.7",  # Specify Python version requirement if needed
+)
+### test_cli.py ###
+import subprocess
+import json
+import pytest
+from pathlib import Path
+
+
+@pytest.fixture
+def setup_codebase(tmp_path):
+    """Creates a temporary codebase for CLI testing with the correct structure."""
+    codebase = tmp_path / "codebase"
+    codebase.mkdir()
+
+    # Create test.py
+    (codebase / "test.py").write_text("print('Hello')")
+
+    # Create subdir with both script.py and nested.py
+    sub_dir = codebase / "subdir"
+    sub_dir.mkdir()
+    (sub_dir / "script.py").write_text("print('Nested Script')")
+    (sub_dir / "nested.py").write_text("print('Nested')")
+
+    # Ensure .result exists for clean_result test
+    result_dir = codebase / ".result"
+    result_dir.mkdir()
+    (result_dir / "old_output.txt").write_text("Old Content")
+    (result_dir / "keep.txt").write_text("Keep Me")
+
+    return codebase
+
+
+import subprocess
+import pytest
+from pathlib import Path
+
+def run_cli_command(command, cwd, expect_error=False):
+    """Runs CLI command using installed package and returns output or error."""
+    result = subprocess.run(
+        ["python", "-m", "codepromptforge.cli"] + command,  # ✅ Ensure it runs as module
+        cwd=cwd,
+        text=True,
+        capture_output=True
+    )
+
+    if expect_error:
+        assert result.returncode != 0, f"Expected error but command succeeded: {command}\nOutput: {result.stdout}\nError: {result.stderr}"
+        return result.stderr.strip()
+    else:
+        assert result.returncode == 0, f"Command failed unexpectedly: {command}\nOutput: {result.stdout}\nError: {result.stderr}"
+        return result.stdout.strip()
+
+
+
+# ✅ Test: Generate Directory Tree
+def test_cli_directory_tree(setup_codebase):
+    output = run_cli_command(["tree", "--folder", "."], setup_codebase)
+    assert "subdir" in output, f"Unexpected output: {output}"
+
+
+# ✅ Test: Get File Content
+def test_cli_get_file_content(setup_codebase):
+    output = run_cli_command(["file", "--file", "test.py"], setup_codebase)
+    assert "print('Hello')" in output, f"Unexpected output: {output}"
+
+
+# ✅ Test: List Files in Folder
+def test_cli_get_files_in_folder(setup_codebase):
+    output = run_cli_command(["files", "--folder", "."], setup_codebase)
+    assert output, "Output is empty; expected JSON file list."
+
+    try:
+        files = json.loads(output)
+        assert "test.py" in files, f"test.py not found in: {files}"
+    except json.JSONDecodeError:
+        pytest.fail(f"Failed to parse JSON output: {output}")
+
+
+def test_cli_get_files_recursively(setup_codebase):
+    output = run_cli_command(["files_recursive", "--folder", "."], setup_codebase)
+    assert output, "Output is empty; expected JSON file list."
+
+    try:
+        files = json.loads(output)
+        assert "test.py" in files, f"test.py not found in: {files}"
+        assert "subdir/script.py" in files, f"subdir/script.py not found in: {files}"
+    except json.JSONDecodeError:
+        pytest.fail(f"Failed to parse JSON output: {output}")
+
+
+def test_cli_write_file(setup_codebase):
+    result_dir = setup_codebase / ".result"
+    run_cli_command(["write", "--file", "output.txt", "--content", "Test Write"], setup_codebase)
+
+    result_file = result_dir / "output.txt"
+    assert result_file.exists(), "File was not created in .result directory."
+    assert result_file.read_text() == "Test Write", f"Unexpected file content: {result_file.read_text()}"
+
+
+def test_cli_combine_files(setup_codebase):
+    output_file = setup_codebase / "combined.txt"
+    run_cli_command(["combine", "--extensions", "py", "--output-file", "combined.txt"], setup_codebase)
+
+    assert output_file.exists(), "Output file was not created."
+    content = output_file.read_text()
+    assert "print('Hello')" in content, "Combined file missing 'test.py' content."
+    assert "print('Nested Script')" in content, "Combined file missing 'script.py' content."
+
+
+def test_cli_exclude_from_combination(setup_codebase):
+    output_file = setup_codebase / "combined_exclude.txt"
+    run_cli_command(["combine", "--extensions", "py", "--output-file", "combined_exclude.txt", "--exclude", "test.py"], setup_codebase)
+
+    assert output_file.exists(), "Output file was not created."
+    content = output_file.read_text()
+    assert "print('Nested Script')" in content, "Expected 'script.py' in output."
+    assert "print('Hello')" not in content, "Excluded 'test.py' should not be in output."
+
+
+def test_cli_clean_result(setup_codebase):
+    result_dir = setup_codebase / ".result"
+    run_cli_command(["clean_result", "--exclude-clean", "old_output.txt"], setup_codebase)
+
+    assert not (result_dir / "old_output.txt").exists(), "Excluded file should be deleted."
+    assert (result_dir / "keep.txt").exists(), "Non-excluded file should not be deleted."
+
+
+# ✅ Test: Error Handling - Missing Arguments
+def test_cli_missing_arguments(setup_codebase):
+    error_output = run_cli_command(["tree"], setup_codebase, expect_error=True)
+    assert "The --folder argument is required" in error_output
+
+    error_output = run_cli_command(["file"], setup_codebase, expect_error=True)
+    assert "The --file argument is required" in error_output
+
+    error_output = run_cli_command(["combine", "--extensions", "py"], setup_codebase, expect_error=True)
+    assert "--output-file are required for 'combine'" in error_output
+### test_promptforge.py ###
+import pytest
+import json
+from pathlib import Path
+from codepromptforge.main import (
+    CodePromptForge,
+    InvalidBaseDirectoryError,
+    NoFilesFoundError,
+    OutputFileAlreadyExistsError
+)
+
+@pytest.fixture
+def setup_codebase(tmp_path):
+    """Creates a temporary codebase for testing LangChain tools."""
+    codebase = tmp_path / "codebase"
+    codebase.mkdir()
+    
+    # Create test.py
+    (codebase / "test.py").write_text("print('Hello')")
+    
+    # Create a subdirectory
+    sub_dir = codebase / "subdir"
+    sub_dir.mkdir()
+    (sub_dir / "script.py").write_text("print('Nested Script')")
+    (sub_dir / "nested.py").write_text("print('Nested')")
+
+    # Ensure .result directory exists
+    result_dir = codebase / ".result"
+    result_dir.mkdir()
+    (result_dir / "old_output.txt").write_text("Old Content")
+    (result_dir / "keep.txt").write_text("Keep Me")
+
+    return codebase
+
+def test_invalid_base_directory():
+    """Ensure invalid directory raises an error."""
+    with pytest.raises(InvalidBaseDirectoryError):
+        forge = CodePromptForge(base_dir="non_existent_dir", output_file="output.txt")
+        forge.run(["py"])
+
+def test_no_files_found(tmp_path):
+    """Ensure error is raised when no matching files are found."""
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    forge = CodePromptForge(base_dir=str(empty_dir), output_file=str(tmp_path / "merged.txt"))
+
+    with pytest.raises(NoFilesFoundError):
+        forge.run(["py"])
+
+def test_forge_prompt_dry_run(tmp_path):
+    """Ensure dry-run mode does not create an output file."""
+    code_dir = tmp_path / "codebase"
+    code_dir.mkdir()
+    (code_dir / "test.py").write_text("# sample python file")
+
+    output_file = tmp_path / "merged.txt"
+    forge = CodePromptForge(base_dir=str(code_dir), output_file=str(output_file), dry_run=True)
+    forge.run(["py"])
+
+    assert not output_file.exists()
+
+def test_forge_prompt_force_overwrite(tmp_path):
+    """Ensure forced overwrite replaces the output file."""
+    code_dir = tmp_path / "codebase"
+    code_dir.mkdir()
+    (code_dir / "test.py").write_text("# sample python file")
+
+    output_file = tmp_path / "merged.txt"
+    output_file.write_text("Existing content")
+
+    forge_no_force = CodePromptForge(base_dir=str(code_dir), output_file=str(output_file), force=False)
+    with pytest.raises(OutputFileAlreadyExistsError):
+        forge_no_force.run(["py"])
+
+    forge_force = CodePromptForge(base_dir=str(code_dir), output_file=str(output_file), force=True)
+    forge_force.run(["py"])
+
+    merged_content = output_file.read_text()
+    assert "sample python file" in merged_content
+
+def test_include_tree(tmp_path):
+    """Ensure directory structure is included in output."""
+    code_dir = tmp_path / "codebase"
+    code_dir.mkdir()
+    sub_dir = code_dir / "subfolder"
+    sub_dir.mkdir()
+    (sub_dir / "test.py").write_text("# sample python file in subfolder")
+    (code_dir / "main.py").write_text("# main python file")
+
+    output_file = tmp_path / "merged_tree.txt"
+    forge = CodePromptForge(base_dir=str(code_dir), output_file=str(output_file), include_tree=True, force=True)
+    forge.run(["py"])
+    merged_content = output_file.read_text()
+
+    assert "subfolder/test.py" in merged_content
+    assert "main.py" in merged_content
+
+def test_get_directory_tree(tmp_path):
+    """Ensure directory structure is returned correctly as a list of files."""
+    code_dir = tmp_path / "codebase"
+    code_dir.mkdir()
+    (code_dir / "file.py").write_text("# test file")
+    sub_dir = code_dir / "subdir"
+    sub_dir.mkdir()
+    (sub_dir / "test.py").write_text("# test in subdir")
+
+    forge = CodePromptForge(base_dir=str(code_dir))
+    tree_output = forge.get_directory_tree(".")
+
+    assert sorted(tree_output) == sorted(["file.py", "subdir/test.py"])
+
+def test_get_file_content(tmp_path):
+    """Ensure file contents are correctly read."""
+    code_dir = tmp_path / "codebase"
+    code_dir.mkdir()
+    file_path = code_dir / "test.py"
+    file_path.write_text("print('Hello')")
+
+    forge = CodePromptForge(base_dir=str(code_dir))
+    content = forge.get_file_content("test.py")
+
+    assert content == "print('Hello')"
+
+def test_get_files_in_folder(tmp_path):
+    """Ensure all files in a directory are listed correctly."""
+    code_dir = tmp_path / "codebase"
+    code_dir.mkdir()
+    (code_dir / "test1.py").write_text("print('1')")
+    (code_dir / "test2.py").write_text("print('2')")
+
+    forge = CodePromptForge(base_dir=str(code_dir))
+    files = forge.get_files_in_folder(".")
+
+    assert len(files) == 2
+    assert files["test1.py"] == "print('1')"
+    assert files["test2.py"] == "print('2')"
+
+def test_get_files_recursively(tmp_path):
+    """Ensure recursive file listing works correctly."""
+    code_dir = tmp_path / "codebase"
+    code_dir.mkdir()
+    subdir = code_dir / "subdir"
+    subdir.mkdir()
+    (code_dir / "main.py").write_text("print('main')")
+    (subdir / "nested.py").write_text("print('nested')")
+
+    forge = CodePromptForge(base_dir=str(code_dir))
+    files = forge.get_files_recursively(".")
+
+    assert sorted(files.keys()) == sorted(["main.py", "subdir/nested.py"])
+
+def test_write_file(tmp_path):
+    """Ensure writing to a file works correctly."""
+    code_dir = tmp_path / "codebase"
+    code_dir.mkdir()
+
+    forge = CodePromptForge(base_dir=str(code_dir))
+    forge.write_file("output.txt", "Hello World")
+
+    result_file = code_dir / ".result/output.txt"
+    assert result_file.exists()
+    assert result_file.read_text() == "Hello World"
+
+def test_clean_result_folder(tmp_path):
+    """Ensure specified files in `.result` are removed."""
+    code_dir = tmp_path / "codebase"
+    code_dir.mkdir()
+    forge = CodePromptForge(base_dir=str(code_dir))
+
+    result_file_1 = code_dir / ".result/file1.txt"
+    result_file_2 = code_dir / ".result/file2.txt"
+    result_file_1.write_text("content1")
+    result_file_2.write_text("content2")
+
+    forge.clean_result_folder(["file1.txt"])
+
+    assert not result_file_1.exists()  # Deleted
+    assert result_file_2.exists()  # Still exists
+
+def test_find_files_tool(tmp_path):
+    """Ensure files are found correctly using the tool."""
+    code_dir = tmp_path / "codebase"
+    code_dir.mkdir()
+    (code_dir / "script.py").write_text("print('script')")
+    (code_dir / "module.py").write_text("print('module')")
+
+    forge = CodePromptForge(base_dir=str(code_dir))
+    tool = next(tool for tool in forge.get_tools() if tool.name == "find_files")
+    files = tool._run(extensions=["py"])
+
+    # Convert full paths to relative paths
+    filenames = [str(Path(file).relative_to(code_dir)) for file in files]
+
+    assert sorted(filenames) == sorted(["script.py", "module.py"])

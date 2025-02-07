@@ -1,0 +1,13 @@
+codehammer==0.0.1
+pydotenv
+pytest
+pydantic
+langchain
+pathspec
+langchain_community
+langchain_openai
+langchain_ollama
+langgraph
+ollama
+duckduckgo-search
+flask

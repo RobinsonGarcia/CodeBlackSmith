@@ -1,0 +1,4 @@
+[console_scripts]
+blacksmith = codeblacksmith.cli:main
+codeblacksmith = codeblacksmith.cli:main
+smith = codeblacksmith.cli:main
