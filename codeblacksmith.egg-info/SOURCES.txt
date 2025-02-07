@@ -2,6 +2,7 @@ README.md
 setup.py
 codeblacksmith/__init__.py
 codeblacksmith/cli.py
+codeblacksmith/config.py
 codeblacksmith/model_loader.py
 codeblacksmith.egg-info/PKG-INFO
 codeblacksmith.egg-info/SOURCES.txt

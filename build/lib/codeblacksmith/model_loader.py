@@ -2,11 +2,9 @@ import os
 import ollama
 from langchain_openai import AzureChatOpenAI
 from langchain_ollama import ChatOllama
-from dotenv import load_dotenv
 
-# Load environment variables from .env at the root directory
-ROOT_ENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.env"))
-load_dotenv(ROOT_ENV_PATH)
+# Ensure environment variables are loaded globally
+from . import config
 
 class ModelLoader:
     """
@@ -53,7 +51,7 @@ class ModelLoader:
                 return []
         return []
     
-    def check_if_model_exists(model_name):
+    def check_if_model_exists(self, model_name):
         if self.provider == "ollama":
             available_models = [m["model"] for m in ollama.list()["models"]]
             if model_name in available_models:
@@ -65,7 +63,7 @@ class ModelLoader:
                     f"   ollama pull {model_name}\n"
                     f"\n🔹 Available models: {', '.join(available_models) if available_models else 'None'}"
                 )
-                raise ModelNotFoundError(error_message)
+                raise ValueError(error_message)
         else:
             return True
 

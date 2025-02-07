@@ -25,7 +25,7 @@ def main():
 
     # Register CodeHammer CLI commands
     try:
-        import codehammer.cli
+        import codehammer
         codehammer.cli.register_core_commands(subparsers)
     except ImportError:
         print("⚠️ Warning: CodeHammer is not installed. CLI commands will be limited.")

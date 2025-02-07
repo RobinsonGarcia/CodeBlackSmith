@@ -12,6 +12,7 @@ Requires-Python: >=3.7
 Description-Content-Type: text/markdown
 Requires-Dist: codehammer==0.0.1
 Requires-Dist: pydotenv
+Requires-Dist: python-dotenv
 Requires-Dist: pytest
 Requires-Dist: pydantic
 Requires-Dist: langchain

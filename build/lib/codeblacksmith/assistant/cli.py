@@ -27,14 +27,13 @@ def __check_if_model_exists(model_name):
         raise ModelNotFoundError(error_message)
     
 
-check_if_model_exists = loader.check_if_model_exists
 
 #########################
 # Assistant CLI Handlers#
 #########################
 def start_assistant(model_name, base_dir, temperature, num_ctx):
     try:
-        check_if_model_exists(model_name)
+        loader.check_if_model_exists(model_name)
         print("✅ Model is available.")
     except ModelNotFoundError as e:
         print(e, file=sys.stderr)

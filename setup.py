@@ -15,6 +15,7 @@ setup(
     install_requires=[
         "codehammer==0.0.1",
         "pydotenv",
+        "python-dotenv",
         "pytest",
         "pydantic",
         "langchain",
