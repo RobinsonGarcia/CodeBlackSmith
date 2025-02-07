@@ -9,7 +9,7 @@ from .assistant.cli import register_commands as register_assistant_commands
 #######################
 def forward_to_codehammer():
     """Forward unknown commands to CodeHammer."""
-    command = [sys.executable, "-m", "codehammer.cli"] + sys.argv[1:]
+    command = [sys.executable, "-m", "codehammer.core.cli"] + sys.argv[1:]
     result = subprocess.run(command, capture_output=True, text=True)
     print(result.stdout)
     if result.stderr:
